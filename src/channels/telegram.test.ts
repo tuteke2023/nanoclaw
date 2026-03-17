@@ -24,6 +24,11 @@ vi.mock('../logger.js', () => ({
   },
 }));
 
+// Mock group-folder (used by photo handler)
+vi.mock('../group-folder.js', () => ({
+  resolveGroupFolderPath: vi.fn((folder: string) => `/tmp/test-groups/${folder}`),
+}));
+
 // --- Grammy mock ---
 
 type Handler = (...args: any[]) => any;
@@ -136,6 +141,8 @@ function createMediaCtx(overrides: {
   messageId?: number;
   caption?: string;
   extra?: Record<string, any>;
+  photo?: Array<{ file_id: string; width: number; height: number }>;
+  api?: { getFile: ReturnType<typeof vi.fn> };
 }) {
   const chatId = overrides.chatId ?? 100200300;
   return {
@@ -153,8 +160,10 @@ function createMediaCtx(overrides: {
       date: overrides.date ?? Math.floor(Date.now() / 1000),
       message_id: overrides.messageId ?? 1,
       caption: overrides.caption,
+      photo: overrides.photo,
       ...(overrides.extra || {}),
     },
+    api: overrides.api || { getFile: vi.fn() },
     me: { username: 'andy_ai_bot' },
   };
 }
@@ -541,12 +550,15 @@ describe('TelegramChannel', () => {
   // --- Non-text messages ---
 
   describe('non-text messages', () => {
-    it('stores photo with placeholder', async () => {
+    it('falls back to placeholder when photo download fails', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
-      const ctx = createMediaCtx({});
+      const ctx = createMediaCtx({
+        photo: [{ file_id: 'abc', width: 100, height: 100 }],
+        api: { getFile: vi.fn().mockRejectedValue(new Error('fail')) },
+      });
       await triggerMediaMessage('message:photo', ctx);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -555,12 +567,16 @@ describe('TelegramChannel', () => {
       );
     });
 
-    it('stores photo with caption', async () => {
+    it('falls back to placeholder with caption when download fails', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
-      const ctx = createMediaCtx({ caption: 'Look at this' });
+      const ctx = createMediaCtx({
+        caption: 'Look at this',
+        photo: [{ file_id: 'abc', width: 100, height: 100 }],
+        api: { getFile: vi.fn().mockRejectedValue(new Error('fail')) },
+      });
       await triggerMediaMessage('message:photo', ctx);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -611,13 +627,53 @@ describe('TelegramChannel', () => {
       );
     });
 
-    it('stores document with filename', async () => {
+    it('downloads and saves document with container path', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const fsMod = await import('fs');
+      vi.spyOn(fsMod.default, 'mkdirSync').mockReturnValue(undefined);
+      vi.spyOn(fsMod.default, 'writeFileSync').mockReturnValue(undefined);
+
+      const ctx = createMediaCtx({
+        messageId: 42,
+        extra: { document: { file_id: 'doc123', file_name: 'report.pdf' } },
+        api: {
+          getFile: vi.fn().mockResolvedValue({ file_path: 'documents/file_0.pdf' }),
+        },
+      });
+
+      // Mock downloadTelegramFile via https mock
+      const httpsMod = await import('https');
+      const { PassThrough } = await import('stream');
+      vi.spyOn(httpsMod.default, 'get').mockImplementation((_url: any, cb: any) => {
+        const response = new PassThrough() as any;
+        response.statusCode = 200;
+        response.headers = {};
+        cb(response);
+        response.end(Buffer.from('PDF content'));
+        return { on: vi.fn().mockReturnThis() } as any;
+      });
+
+      await triggerMediaMessage('message:document', ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          content: '[Document: /workspace/group/documents/tg-42-report.pdf]',
+        }),
+      );
+    });
+
+    it('falls back to placeholder when document download fails', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
       const ctx = createMediaCtx({
-        extra: { document: { file_name: 'report.pdf' } },
+        extra: { document: { file_id: 'doc123', file_name: 'report.pdf' } },
+        api: { getFile: vi.fn().mockRejectedValue(new Error('fail')) },
       });
       await triggerMediaMessage('message:document', ctx);
 
@@ -627,12 +683,15 @@ describe('TelegramChannel', () => {
       );
     });
 
-    it('stores document with fallback name when filename missing', async () => {
+    it('falls back to placeholder with fallback name when filename missing', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
-      const ctx = createMediaCtx({ extra: { document: {} } });
+      const ctx = createMediaCtx({
+        extra: { document: { file_id: 'doc123' } },
+        api: { getFile: vi.fn().mockRejectedValue(new Error('fail')) },
+      });
       await triggerMediaMessage('message:document', ctx);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
