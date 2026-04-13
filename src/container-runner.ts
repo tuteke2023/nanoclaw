@@ -4,6 +4,7 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -29,6 +30,56 @@ import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL });
+
+// Docker-in-Docker support: when nanoclaw runs inside a container, Docker
+// resolves mount sources on the host filesystem. These env vars map container
+// paths back to host paths. Set them in the nanoclaw container's docker run.
+const HOST_PROJECT_DIR = process.env.HOST_PROJECT_DIR;
+const HOST_SSH_DIR = process.env.HOST_SSH_DIR;
+
+function toHostPath(containerPath: string): string {
+  if (!HOST_PROJECT_DIR) return containerPath;
+  const cwd = process.cwd();
+  if (containerPath.startsWith(cwd)) {
+    return HOST_PROJECT_DIR + containerPath.slice(cwd.length);
+  }
+  return containerPath;
+}
+
+/**
+ * Fix OneCLI CA cert mounts for Docker-in-Docker.
+ * The SDK writes PEM files to /tmp/ inside the nanoclaw container, then adds
+ * volume mounts referencing those /tmp/ paths. Docker resolves mount sources
+ * on the host where /tmp/onecli-*.pem doesn't exist. Fix: copy the PEM files
+ * to a host-visible directory (data/onecli-ca/) and rewrite the mount paths.
+ */
+function fixOneCLICaMounts(args: string[]): void {
+  if (!HOST_PROJECT_DIR) return;
+  const caDir = path.join(DATA_DIR, 'onecli-ca');
+  fs.mkdirSync(caDir, { recursive: true });
+
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== '-v') continue;
+    const mountArg = args[i + 1];
+    if (!mountArg) continue;
+
+    // Match: /tmp/onecli-*.pem:/container/path:ro
+    const match = mountArg.match(
+      /^(\/tmp\/(onecli-[^:]+\.pem)):([^:]+(?::ro)?)$/,
+    );
+    if (!match) continue;
+
+    const [, srcPath, filename, rest] = match;
+    // Copy PEM from nanoclaw container's /tmp/ to host-visible data dir
+    if (fs.existsSync(srcPath)) {
+      fs.copyFileSync(srcPath, path.join(caDir, filename));
+    }
+    // Rewrite mount source to host-visible path
+    const hostCaPath = toHostPath(path.join(caDir, filename));
+    args[i + 1] = `${hostCaPath}:${rest}`;
+    logger.debug({ from: srcPath, to: hostCaPath }, 'Rewrote OneCLI CA mount');
+  }
+}
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -229,6 +280,27 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Git-tracked memory directory — persists agent knowledge across container
+  // rebuilds and can be committed to a repository.
+  const gitMemoryDir = path.join(process.cwd(), 'memory', group.folder);
+  if (fs.existsSync(gitMemoryDir)) {
+    mounts.push({
+      hostPath: gitMemoryDir,
+      containerPath: '/home/node/.claude/memory',
+      readonly: false,
+    });
+  }
+
+  // SSH keys for git push (read-only so agent can't modify keys)
+  const sshDir = HOST_SSH_DIR || path.join(os.homedir(), '.ssh');
+  if (fs.existsSync(sshDir) || HOST_SSH_DIR) {
+    mounts.push({
+      hostPath: HOST_SSH_DIR || sshDir,
+      containerPath: '/home/node/.ssh',
+      readonly: true,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -260,11 +332,19 @@ async function buildContainerArgs(
   });
   if (onecliApplied) {
     logger.info({ containerName }, 'OneCLI gateway config applied');
+    // Fix CA cert mount paths for Docker-in-Docker
+    fixOneCLICaMounts(args);
   } else {
     logger.warn(
       { containerName },
       'OneCLI gateway not reachable — container will have no credentials',
     );
+  }
+
+  // Allow model override via environment variable
+  const model = process.env.CLAUDE_MODEL;
+  if (model) {
+    args.push('-e', `CLAUDE_MODEL=${model}`);
   }
 
   // Runtime-specific args for host gateway resolution
@@ -281,10 +361,11 @@ async function buildContainerArgs(
   }
 
   for (const mount of mounts) {
+    const hostPath = toHostPath(mount.hostPath);
     if (mount.readonly) {
-      args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
+      args.push(...readonlyMountArgs(hostPath, mount.containerPath));
     } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      args.push('-v', `${hostPath}:${mount.containerPath}`);
     }
   }
 
