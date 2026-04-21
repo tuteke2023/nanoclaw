@@ -409,6 +409,7 @@ async function runQuery(
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
+  let lastAssistantText: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
 
@@ -470,6 +471,11 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
       ],
+      // AskUserQuestion is an interactive SDK tool that surfaces an option
+      // picker in UI clients. In a headless container it returns is_error
+      // tool_result, which ends the query with no final text — silencing
+      // the reply. Block it so the agent replies via the channel instead.
+      disallowedTools: ['AskUserQuestion'],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
@@ -501,6 +507,22 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // Capture the latest assistant TEXT content so we can fall back to it
+      // if the SDK ends the query with result:null (e.g. a blocked/errored
+      // tool_use terminates the turn before a final assistant message).
+      const content = (message as { message?: { content?: unknown } }).message
+        ?.content;
+      if (Array.isArray(content)) {
+        const text = content
+          .filter(
+            (c: { type?: string }) =>
+              c && typeof c === 'object' && c.type === 'text',
+          )
+          .map((c: { text?: string }) => c.text || '')
+          .join('')
+          .trim();
+        if (text) lastAssistantText = text;
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -526,14 +548,22 @@ async function runQuery(
       resultCount++;
       const textResult =
         'result' in message ? (message as { result?: string }).result : null;
+      // Fallback: if the SDK ended the turn with no final text (tool_use
+      // terminated the query), surface the last assistant text we captured
+      // so the user still gets a reply instead of silence.
+      const effectiveResult =
+        textResult && textResult.trim() ? textResult : lastAssistantText;
+      const usedFallback = !textResult && !!effectiveResult;
       log(
-        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
+        `Result #${resultCount}: subtype=${message.subtype}${effectiveResult ? ` text=${effectiveResult.slice(0, 200)}${usedFallback ? ' (fallback)' : ''}` : ''}`,
       );
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: effectiveResult || null,
         newSessionId,
       });
+      // Clear so subsequent session-update markers don't re-send this text.
+      lastAssistantText = undefined;
     }
   }
 
